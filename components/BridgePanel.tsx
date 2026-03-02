@@ -14,7 +14,8 @@ import { bsc, mainnet } from 'wagmi/chains';
 import {
   buildBridgeTransferArgs,
   ETHEREUM_USDT,
-  getBridgeQuote,
+  fetchBridgeQuote,
+  notifySourceTransfer,
   SOURCE_BRIDGE_CONTRACT,
   waitForTargetChainCompletion
 } from '@/lib/bridge-sdk';
@@ -70,7 +71,7 @@ export function BridgePanel() {
 
     // 1) 获取桥 quote（手续费、预计到账、最小到账）
     setStatus('步骤 1/5：获取 bridge quote...');
-    const quote = await getBridgeQuote(parsedAmount);
+    const quote = await fetchBridgeQuote(parsedAmount);
     setQuoteText(
       `fee: ${formatUnits(quote.fee, 6)} USDT, 预计到账: ${formatUnits(
         quote.estimatedReceive,
@@ -112,6 +113,9 @@ export function BridgePanel() {
     // 4) 监听 source tx 状态
     setStatus('步骤 5/5：等待 source tx 确认并查询目标链状态...');
     await ethPublicClient.waitForTransactionReceipt({ hash: bridgeHash });
+
+    // 通知后端：源链交易已确认，开始生成/追踪目标链交易
+    await notifySourceTransfer(bridgeHash);
 
     // 5) 轮询目标链是否完成
     const target = await waitForTargetChainCompletion({

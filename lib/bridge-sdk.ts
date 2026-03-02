@@ -1,4 +1,6 @@
 import { Address, Hash, PublicClient } from 'viem';
+import { BridgeQuoteResponse, BridgeStatusResponse } from './bridge-types';
+import { buildTransferArgs, calculateQuote } from './bridge-math';
 
 export type BridgeQuote = {
   fee: bigint;
@@ -11,41 +13,52 @@ export type BridgeTransferParams = {
   recipient: Address;
 };
 
-const MOCK_SLIPPAGE_BPS = 30n; // 0.3%
-const MOCK_FEE_BPS = 20n; // 0.2%
-
-/**
- * 模拟桥 SDK：返回手续费和预计到账数量。
- * 实际接入时可替换为第三方桥接协议 SDK/API。
- */
 export async function getBridgeQuote(amount: bigint): Promise<BridgeQuote> {
-  await sleep(600);
-  const fee = (amount * MOCK_FEE_BPS) / 10_000n;
-  const estimatedReceive = amount - fee;
-  const minReceive = estimatedReceive - (estimatedReceive * MOCK_SLIPPAGE_BPS) / 10_000n;
-  return { fee, estimatedReceive, minReceive };
+  await sleep(300);
+  return calculateQuote(amount);
 }
 
-/**
- * 模拟桥 SDK：查询目标链是否完成。
- * 若配置了 NEXT_PUBLIC_BRIDGE_STATUS_API，会调用该 API 轮询 sourceTxHash 对应的 targetTxHash。
- */
-export async function queryTargetTxHash(sourceTxHash: Hash): Promise<Hash | null> {
-  const statusApi = process.env.NEXT_PUBLIC_BRIDGE_STATUS_API;
-  if (!statusApi) return null;
+export async function fetchBridgeQuote(amount: bigint): Promise<BridgeQuote> {
+  const res = await fetch(`/api/bridge/quote?amount=${amount.toString()}`);
+  if (!res.ok) {
+    throw new Error(`Quote API error: ${res.status}`);
+  }
 
-  const res = await fetch(`${statusApi}?sourceTxHash=${sourceTxHash}`);
+  const data = (await res.json()) as BridgeQuoteResponse;
+  return {
+    fee: BigInt(data.fee),
+    estimatedReceive: BigInt(data.estimatedReceive),
+    minReceive: BigInt(data.minReceive)
+  };
+}
+
+export async function notifySourceTransfer(sourceTxHash: Hash): Promise<void> {
+  const res = await fetch('/api/bridge/transfer', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sourceTxHash })
+  });
+
+  if (!res.ok) {
+    throw new Error(`Transfer API error: ${res.status}`);
+  }
+}
+
+export async function queryTargetTxHash(sourceTxHash: Hash): Promise<{ hash: Hash; blockNumber?: bigint } | null> {
+  const res = await fetch(`/api/bridge/status?sourceTxHash=${sourceTxHash}`);
   if (!res.ok) {
     throw new Error(`Bridge status API error: ${res.status}`);
   }
 
-  const data = (await res.json()) as { targetTxHash?: Hash };
-  return data.targetTxHash ?? null;
+  const data = (await res.json()) as BridgeStatusResponse;
+  if (!data.completed || !data.targetTxHash) return null;
+
+  return {
+    hash: data.targetTxHash,
+    blockNumber: data.targetBlockNumber ? BigInt(data.targetBlockNumber) : undefined
+  };
 }
 
-/**
- * 在目标链轮询 tx receipt，确认跨链是否落地。
- */
 export async function waitForTargetChainCompletion(params: {
   sourceTxHash: Hash;
   bscPublicClient: PublicClient;
@@ -56,14 +69,19 @@ export async function waitForTargetChainCompletion(params: {
   const startedAt = Date.now();
 
   while (Date.now() - startedAt < timeoutMs) {
-    const targetTxHash = await queryTargetTxHash(sourceTxHash);
-    if (targetTxHash) {
-      const receipt = await bscPublicClient.getTransactionReceipt({ hash: targetTxHash });
+    const target = await queryTargetTxHash(sourceTxHash);
+    if (target) {
+      if (target.blockNumber) {
+        return { targetTxHash: target.hash, blockNumber: target.blockNumber };
+      }
+
+      const receipt = await bscPublicClient.getTransactionReceipt({ hash: target.hash });
       if (receipt.status === 'success') {
-        return { targetTxHash, blockNumber: receipt.blockNumber };
+        return { targetTxHash: target.hash, blockNumber: receipt.blockNumber };
       }
       throw new Error('Target chain tx failed.');
     }
+
     await sleep(intervalMs);
   }
 
@@ -79,6 +97,5 @@ export async function sleep(ms: number) {
 
 export function buildBridgeTransferArgs(params: BridgeTransferParams & { minReceive: bigint }) {
   const { amount, recipient, minReceive } = params;
-  // 示例签名: bridgeUSDT(uint256 amount, uint256 minReceive, uint256 dstChainId, address recipient)
-  return [amount, minReceive, 56n, recipient] as const;
+  return buildTransferArgs(amount, minReceive, recipient);
 }
